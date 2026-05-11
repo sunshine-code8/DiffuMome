@@ -1,0 +1,280 @@
+# ------------------------------------------------------------------------
+# Diffusion decoder utilities for MoME.
+# Keeps MoME's multi-expert feature contract while adopting the
+# time-conditioned reference refinement loop used by DiffuDETR/DiffuPETR.
+# ------------------------------------------------------------------------
+
+import copy
+import math
+import warnings
+
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint as cp
+from mmcv.cnn import build_norm_layer
+from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER, TRANSFORMER_LAYER_SEQUENCE
+from mmcv.cnn.bricks.transformer import BaseTransformerLayer, TransformerLayerSequence
+from mmdet.models.utils.transformer import inverse_sigmoid
+
+REF_CLAMP_EPS = 1e-4
+
+
+def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
+    scale = 2 * math.pi
+    pos = pos * scale
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+    dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+    pos_x = pos[..., 0, None] / dim_t
+    pos_y = pos[..., 1, None] / dim_t
+    pos_z = pos[..., 2, None] / dim_t
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_z = torch.stack((pos_z[..., 0::2].sin(), pos_z[..., 1::2].cos()), dim=-1).flatten(-2)
+    return torch.cat((pos_y, pos_x, pos_z), dim=-1)
+
+
+def timestep_embedding(timesteps, dim, max_period=10000):
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device)
+        / half)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
+class TimeStepBlock(nn.Module):
+    def __init__(self, channels, emb_channels):
+        super(TimeStepBlock, self).__init__()
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_channels, channels * 2),
+        )
+
+    def forward(self, x, time_embed):
+        if time_embed is None:
+            return x
+        emb_out = self.emb_layers(time_embed).type_as(x)
+        scale, shift = emb_out.chunk(2, dim=-1)
+        if x.dim() == 3 and x.shape[1] == time_embed.shape[0]:
+            scale = scale.unsqueeze(0)
+            shift = shift.unsqueeze(0)
+        else:
+            while scale.dim() < x.dim():
+                scale = scale.unsqueeze(1)
+                shift = shift.unsqueeze(1)
+        return x * (1 + scale) + shift
+
+
+@TRANSFORMER_LAYER.register_module()
+class DiffuMOMETransformerDecoderLayer(BaseTransformerLayer):
+    """PETR-compatible decoder layer with DiffuDETR timestep conditioning."""
+
+    def __init__(self,
+                 attn_cfgs,
+                 feedforward_channels,
+                 ffn_dropout=0.0,
+                 operation_order=None,
+                 act_cfg=dict(type='ReLU', inplace=True),
+                 norm_cfg=dict(type='LN'),
+                 ffn_num_fcs=2,
+                 with_cp=True,
+                 **kwargs):
+        super(DiffuMOMETransformerDecoderLayer, self).__init__(
+            attn_cfgs=attn_cfgs,
+            feedforward_channels=feedforward_channels,
+            ffn_dropout=ffn_dropout,
+            operation_order=operation_order,
+            act_cfg=act_cfg,
+            norm_cfg=norm_cfg,
+            ffn_num_fcs=ffn_num_fcs,
+            **kwargs)
+        assert len(operation_order) == 6
+        assert set(operation_order) == set(['self_attn', 'norm', 'cross_attn', 'ffn'])
+        self.use_checkpoint = with_cp
+        num_time_blocks = self.num_attn + len(self.ffns)
+        time_step_embed = TimeStepBlock(self.embed_dims, self.embed_dims * 4)
+        self.time_step_embeds = nn.ModuleList(
+            [copy.deepcopy(time_step_embed) for _ in range(num_time_blocks)])
+
+    def apply_time_step(self, query, t, t_index, no_queries=None):
+        if t is None:
+            return query, t_index
+        if no_queries is not None and len(no_queries) > 0:
+            num_plain = int(no_queries[0])
+            if num_plain > 0 and query.size(0) > num_plain:
+                x = self.time_step_embeds[t_index](query[num_plain:], t)
+                query = torch.cat([query[:num_plain], x], dim=0)
+            else:
+                query = self.time_step_embeds[t_index](query, t)
+        else:
+            query = self.time_step_embeds[t_index](query, t)
+        return query, t_index + 1
+
+    def _forward(self,
+                 query,
+                 key=None,
+                 value=None,
+                 query_pos=None,
+                 key_pos=None,
+                 t=None,
+                 attn_masks=None,
+                 query_key_padding_mask=None,
+                 key_padding_mask=None,
+                 no_queries=None,
+                 **kwargs):
+        norm_index = 0
+        attn_index = 0
+        ffn_index = 0
+        t_index = 0
+        identity = query
+        if attn_masks is None:
+            attn_masks = [None for _ in range(self.num_attn)]
+        elif isinstance(attn_masks, torch.Tensor):
+            attn_masks = [attn_masks for _ in range(self.num_attn)]
+            warnings.warn('Use same attn_mask in all attentions.')
+
+        for layer in self.operation_order:
+            if layer == 'self_attn':
+                query, t_index = self.apply_time_step(query, t, t_index, no_queries)
+                query = self.attentions[attn_index](
+                    query,
+                    query,
+                    query,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=query_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+            elif layer == 'norm':
+                query = self.norms[norm_index](query)
+                norm_index += 1
+            elif layer == 'cross_attn':
+                query, t_index = self.apply_time_step(query, t, t_index, no_queries)
+                query = self.attentions[attn_index](
+                    query,
+                    key,
+                    value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=key_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+            elif layer == 'ffn':
+                query, t_index = self.apply_time_step(query, t, t_index, no_queries)
+                query = self.ffns[ffn_index](query, identity if self.pre_norm else None)
+                ffn_index += 1
+        return query
+
+    def forward(self,
+                query,
+                key=None,
+                value=None,
+                query_pos=None,
+                key_pos=None,
+                t=None,
+                attn_masks=None,
+                query_key_padding_mask=None,
+                key_padding_mask=None,
+                no_queries=None,
+                **kwargs):
+        if self.use_checkpoint and self.training:
+            return cp.checkpoint(
+                self._forward,
+                query,
+                key,
+                value,
+                query_pos,
+                key_pos,
+                t,
+                attn_masks,
+                query_key_padding_mask,
+                key_padding_mask,
+                no_queries)
+        return self._forward(
+            query,
+            key=key,
+            value=value,
+            query_pos=query_pos,
+            key_pos=key_pos,
+            t=t,
+            attn_masks=attn_masks,
+            query_key_padding_mask=query_key_padding_mask,
+            key_padding_mask=key_padding_mask,
+            no_queries=no_queries,
+            **kwargs)
+
+
+@TRANSFORMER_LAYER_SEQUENCE.register_module()
+class DiffuMOMETransformerDecoder(TransformerLayerSequence):
+    """MoME decoder with DiffuDETR-style timestep and reference refinement."""
+
+    def __init__(self,
+                 *args,
+                 post_norm_cfg=dict(type='LN'),
+                 return_intermediate=False,
+                 **kwargs):
+        super(DiffuMOMETransformerDecoder, self).__init__(*args, **kwargs)
+        self.return_intermediate = return_intermediate
+        self.post_norm = build_norm_layer(post_norm_cfg, self.embed_dims)[1] \
+            if post_norm_cfg is not None else None
+
+    def _make_query_pos(self, reference_points, query_embedding=None):
+        reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+        return query_embedding(pos2posemb3d(reference_points)).transpose(0, 1)
+
+    def _update_reference(self, reference_points, reg_out):
+        reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+        inv_reference = inverse_sigmoid(reference_points)
+        new_reference_points = reference_points.clone()
+        new_reference_points[..., 0:2] = (
+            reg_out[..., 0:2] + inv_reference[..., 0:2]).sigmoid()
+        new_reference_points[..., 2:3] = (
+            reg_out[..., 4:5] + inv_reference[..., 2:3]).sigmoid()
+        return new_reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+
+    def forward(self, query, *args, **kwargs):
+        reg_branch = kwargs.pop('reg_branch', None)
+        reference_points = kwargs.pop('reference_points', None)
+        query_embedding = kwargs.pop('query_embedding', None)
+        kwargs.pop('query_pos', None)
+        if reference_points is None or query_embedding is None:
+            raise ValueError('DiffuMOME decoder requires reference_points and query_embedding.')
+
+        if not self.return_intermediate:
+            query_pos = self._make_query_pos(reference_points, query_embedding)
+            x = super().forward(query, *args, query_pos=query_pos, **kwargs)
+            if reg_branch is not None:
+                with torch.no_grad():
+                    reference_points = self._update_reference(
+                        reference_points, reg_branch[-1](x.transpose(0, 1))).detach()
+            if self.post_norm:
+                x = self.post_norm(x)[None]
+            return x, reference_points[None]
+
+        intermediate = []
+        intermediate_reference_points = []
+        current_reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+        for layer in self.layers:
+            layer_idx = len(intermediate)
+            query_pos = self._make_query_pos(current_reference_points, query_embedding)
+            query = layer(query, *args, query_pos=query_pos, **kwargs)
+            output = self.post_norm(query) if self.post_norm is not None else query
+            if reg_branch is not None:
+                reg_out = reg_branch[layer_idx](output.transpose(0, 1))
+                new_reference_points = self._update_reference(current_reference_points, reg_out)
+                current_reference_points = new_reference_points.detach()
+            else:
+                new_reference_points = current_reference_points
+            intermediate.append(output)
+            intermediate_reference_points.append(new_reference_points)
+        return torch.stack(intermediate), torch.stack(intermediate_reference_points)
