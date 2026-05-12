@@ -647,9 +647,10 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                           mask_dict['map_known_indice'].long().to(device))] = dn_labels
 
         self._check_query_labels(query_labels, 'train')
-        query_content = self.label_enc(query_labels)
-        if self.diffuse_query_content:
-            query_content = self.q_sample(query_content, time_steps)
+        # Keep query content and noisy 3D reference points separated, matching
+        # DiffuDETR decoder semantics while preserving MOAD's zero target +
+        # BEV/RV query_pos design. Labels remain in mask_dict for DN losses.
+        query_content = None
         return reference_points, attn_mask, mask_dict, time_steps, query_content
 
     def _test_query_content(self, batch_size, num_queries, device, proposal_query_content=None):
@@ -822,10 +823,8 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
     def ddim_sample_single(self, x, x_img, img_metas, points):
         device = x.device
         batch_size = x.shape[0]
-        proposal_query_content = None
         if self.use_feature_proposal_init:
-            base_reference_points, proposal_query_content = self._feature_proposal_init(
-                x, x_img, img_metas, return_query_content=True)
+            base_reference_points = self._feature_proposal_init(x, x_img, img_metas)
         else:
             base_reference_points = self.reference_points.weight.to(device).unsqueeze(0).repeat(batch_size, 1, 1)
         init_t = torch.full((batch_size,), self.num_timesteps - 1, device=device, dtype=torch.long)
@@ -837,9 +836,10 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             init_noise = torch.randn(base_reference_points.shape, device=device, generator=generator)
         reference_points, _ = self.apply_box_noise(base_reference_points, init_t, noise=init_noise)
         reference_scaled = (reference_points * 2. - 1.) * self.diffusion_scale
-        query_content = self._test_query_content(
-            batch_size, self.num_query, device,
-            proposal_query_content=proposal_query_content)
+        # Keep MOAD decoder query semantics at test time: proposal FFN only
+        # initializes reference points, while query content stays the original
+        # zero target driven by MOAD query_pos/key_pos.
+        query_content = None
 
         times = torch.linspace(
             0, self.num_timesteps - 1,
