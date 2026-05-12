@@ -1,5 +1,5 @@
 # DiffuMome
-epoch 3
+## epoch 3
 mAP: 0.5625                                                                                                                                                                                                                                                                                  
 mATE: 0.3898
 mASE: 0.2853
