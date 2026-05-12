@@ -232,6 +232,14 @@ class DiffuMOMETransformerDecoder(TransformerLayerSequence):
         reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         return query_embedding(pos2posemb3d(reference_points)).transpose(0, 1)
 
+    def _compose_query_pos(self, input_query_pos, reference_points, query_embedding=None):
+        if query_embedding is None:
+            return input_query_pos
+        ref_query_pos = self._make_query_pos(reference_points, query_embedding)
+        if input_query_pos is None:
+            return ref_query_pos
+        return input_query_pos + ref_query_pos
+
     def _update_reference(self, reference_points, reg_out):
         reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         inv_reference = inverse_sigmoid(reference_points)
@@ -246,12 +254,15 @@ class DiffuMOMETransformerDecoder(TransformerLayerSequence):
         reg_branch = kwargs.pop('reg_branch', None)
         reference_points = kwargs.pop('reference_points', None)
         query_embedding = kwargs.pop('query_embedding', None)
-        kwargs.pop('query_pos', None)
-        if reference_points is None or query_embedding is None:
-            raise ValueError('DiffuMOME decoder requires reference_points and query_embedding.')
+        input_query_pos = kwargs.pop('query_pos', None)
+        if reference_points is None:
+            raise ValueError('DiffuMOME decoder requires reference_points.')
+        if input_query_pos is None and query_embedding is None:
+            raise ValueError('DiffuMOME decoder requires MOAD query_pos or query_embedding.')
 
         if not self.return_intermediate:
-            query_pos = self._make_query_pos(reference_points, query_embedding)
+            query_pos = self._compose_query_pos(
+                input_query_pos, reference_points, query_embedding)
             x = super().forward(query, *args, query_pos=query_pos, **kwargs)
             if reg_branch is not None:
                 with torch.no_grad():
@@ -266,7 +277,8 @@ class DiffuMOMETransformerDecoder(TransformerLayerSequence):
         current_reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         for layer in self.layers:
             layer_idx = len(intermediate)
-            query_pos = self._make_query_pos(current_reference_points, query_embedding)
+            query_pos = self._compose_query_pos(
+                input_query_pos, current_reference_points, query_embedding)
             query = layer(query, *args, query_pos=query_pos, **kwargs)
             output = self.post_norm(query) if self.post_norm is not None else query
             if reg_branch is not None:

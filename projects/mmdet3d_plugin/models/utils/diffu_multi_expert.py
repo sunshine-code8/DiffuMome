@@ -79,6 +79,7 @@ class DiffuMultiExpertFuse(BaseModule):
             bev_query_embed = bev_query_embed + self.bev_type_embed
             rv_query_embed = rv_query_embed + self.rv_type_embed
 
+        rv_memory_v = rv_memory
         if self.use_cam_embed and self.cam_embed is not None:
             imgs2lidars = np.stack([np.linalg.inv(meta['lidar2img']) for meta in img_metas])
             imgs2lidars = torch.from_numpy(imgs2lidars).float().to(x.device)
@@ -87,7 +88,7 @@ class DiffuMultiExpertFuse(BaseModule):
             imgs2lidars = imgs2lidars.permute(0, 2, 1).reshape(-1, self.embed_dims, 1, 1)
             imgs2lidars = imgs2lidars.repeat(1, 1, *x_img.shape[-2:])
             imgs2lidars = rearrange(imgs2lidars, '(bs v) c h w -> (v h w) bs c', bs=bs)
-            rv_memory = rv_memory * imgs2lidars
+            rv_memory_v = rv_memory * imgs2lidars
 
         time_embed = None
         if time_steps is not None:
@@ -105,14 +106,17 @@ class DiffuMultiExpertFuse(BaseModule):
         for modality in modalities:
             if modality == "fused":
                 memory = torch.cat([bev_memory, rv_memory], dim=0)
+                memory_v = memory
                 pos_embed = torch.cat([bev_pos_embed, rv_pos_embed], dim=0)
                 query_embed = bev_query_embed + rv_query_embed
             elif modality == "bev":
                 memory = bev_memory
+                memory_v = memory
                 pos_embed = bev_pos_embed
                 query_embed = bev_query_embed
             elif modality in ["img", "rv"]:
                 memory = rv_memory
+                memory_v = rv_memory_v
                 pos_embed = rv_pos_embed
                 query_embed = rv_query_embed
             else:
@@ -124,7 +128,7 @@ class DiffuMultiExpertFuse(BaseModule):
             decoder_kwargs = dict(
                 query=target,
                 key=memory,
-                value=memory,
+                value=memory_v,
                 query_pos=query_embed,
                 key_pos=pos_embed,
                 attn_masks=[attn_masks, None] if attn_masks is not None else None,
@@ -143,7 +147,7 @@ class DiffuMultiExpertFuse(BaseModule):
                 out_dec, inter_references = out_dec
             out_decs.append(out_dec.transpose(1, 2))
             ca_dict['memory_l'].append(memory)
-            ca_dict['memory_v_l'].append(memory)
+            ca_dict['memory_v_l'].append(memory_v)
             ca_dict['query_embed_l'].append(query_embed)
             ca_dict['pos_embed_l'].append(pos_embed)
             ca_dict['zero_idx'].append(
