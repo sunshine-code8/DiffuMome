@@ -1,16 +1,16 @@
 # DiffuMome
 
-epoch4
+epoch5
 
-mAP: 0.5836                                                                                                                                                                                                                                                                                                         
-mATE: 0.3318
+mAP: 0.5850                                                                                                                                                                                                                                                                                                         
+mATE: 0.3290
 
-mASE: 0.2638
+mASE: 0.2609
 
-mAOE: 0.2573
+mAOE: 0.2539
 
-mAVE: 0.2485
+mAVE: 0.2490
 
-mAAE: 0.1798
+mAAE: 0.1828
 
-NDS: 0.6637
+NDS: 0.6649
