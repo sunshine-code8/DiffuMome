@@ -62,6 +62,9 @@ class DiffuMultiExpertFuse(BaseModule):
         for m in self.modules():
             if hasattr(m, 'weight') and m.weight.dim() > 1:
                 xavier_init(m, distribution='uniform')
+        for m in self.modules():
+            if hasattr(m, 'reset_identity'):
+                m.reset_identity()
         self._is_init = True
 
     def forward(self, x, x_img, bev_query_embed, rv_query_embed, bev_pos_embed,

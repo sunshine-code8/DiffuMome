@@ -47,26 +47,39 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 
 
 class TimeStepBlock(nn.Module):
-    def __init__(self, channels, emb_channels):
+    def __init__(self,
+                 channels,
+                 emb_channels,
+                 out_channels=256,
+                 dims=1,
+                 dropout=0.2,
+                 use_scale_shift_norm=True):
         super(TimeStepBlock, self).__init__()
+        self.out_channels = out_channels
+        self.use_scale_shift_norm = use_scale_shift_norm
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(emb_channels, channels * 2),
+            nn.Linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels),
         )
 
     def forward(self, x, time_embed):
         if time_embed is None:
             return x
         emb_out = self.emb_layers(time_embed).type_as(x)
-        scale, shift = emb_out.chunk(2, dim=-1)
         if x.dim() == 3 and x.shape[1] == time_embed.shape[0]:
-            scale = scale.unsqueeze(0)
-            shift = shift.unsqueeze(0)
+            emb_out = emb_out.unsqueeze(0)
+        elif x.dim() == 3 and x.shape[0] == time_embed.shape[0]:
+            emb_out = emb_out.unsqueeze(1)
         else:
-            while scale.dim() < x.dim():
-                scale = scale.unsqueeze(1)
-                shift = shift.unsqueeze(1)
-        return x * (1 + scale) + shift
+            while emb_out.dim() < x.dim():
+                emb_out = emb_out.unsqueeze(1)
+        if self.use_scale_shift_norm:
+            scale, shift = emb_out.chunk(2, dim=-1)
+            h = x * (1 + scale) + shift
+            return x + h
+        return x + emb_out
 
 
 @TRANSFORMER_LAYER.register_module()
@@ -96,7 +109,11 @@ class DiffuMOMETransformerDecoderLayer(BaseTransformerLayer):
         assert set(operation_order) == set(['self_attn', 'norm', 'cross_attn', 'ffn'])
         self.use_checkpoint = with_cp
         num_time_blocks = self.num_attn + len(self.ffns)
-        time_step_embed = TimeStepBlock(self.embed_dims, self.embed_dims * 4)
+        time_step_embed = TimeStepBlock(
+            channels=self.embed_dims,
+            out_channels=self.embed_dims,
+            emb_channels=self.embed_dims * 4,
+            dims=1)
         self.time_step_embeds = nn.ModuleList(
             [copy.deepcopy(time_step_embed) for _ in range(num_time_blocks)])
 
@@ -222,13 +239,22 @@ class DiffuMOMETransformerDecoder(TransformerLayerSequence):
                  *args,
                  post_norm_cfg=dict(type='LN'),
                  return_intermediate=False,
+                 ref_query_pos_scale=0.0,
+                 ref_update_scale=0.0,
                  **kwargs):
         super(DiffuMOMETransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
         self.post_norm = build_norm_layer(post_norm_cfg, self.embed_dims)[1] \
             if post_norm_cfg is not None else None
+        self.ref_query_pos_scale = nn.Parameter(
+            torch.tensor(float(ref_query_pos_scale), dtype=torch.float32))
+        self.ref_update_scale = nn.Parameter(
+            torch.tensor(float(ref_update_scale), dtype=torch.float32))
 
     def _make_query_pos(self, reference_points, query_embedding=None):
+        if reference_points.size(-1) > 3:
+            reference_points = torch.cat(
+                [reference_points[..., 0:2], reference_points[..., 4:5]], dim=-1)
         reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         return query_embedding(pos2posemb3d(reference_points)).transpose(0, 1)
 
@@ -237,17 +263,23 @@ class DiffuMOMETransformerDecoder(TransformerLayerSequence):
             return input_query_pos
         ref_query_pos = self._make_query_pos(reference_points, query_embedding)
         if input_query_pos is None:
-            return ref_query_pos
-        return input_query_pos + ref_query_pos
+            return ref_query_pos * self.ref_query_pos_scale.to(ref_query_pos)
+        return input_query_pos + ref_query_pos * self.ref_query_pos_scale.to(ref_query_pos)
 
     def _update_reference(self, reference_points, reg_out):
         reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         inv_reference = inverse_sigmoid(reference_points)
+        reg_out = reg_out * self.ref_update_scale.to(reg_out)
         new_reference_points = reference_points.clone()
-        new_reference_points[..., 0:2] = (
-            reg_out[..., 0:2] + inv_reference[..., 0:2]).sigmoid()
-        new_reference_points[..., 2:3] = (
-            reg_out[..., 4:5] + inv_reference[..., 2:3]).sigmoid()
+        if reference_points.size(-1) == 3:
+            new_reference_points[..., 0:2] = (
+                reg_out[..., 0:2] + inv_reference[..., 0:2]).sigmoid()
+            new_reference_points[..., 2:3] = (
+                reg_out[..., 4:5] + inv_reference[..., 2:3]).sigmoid()
+        else:
+            ref_dim = min(reference_points.size(-1), reg_out.size(-1))
+            new_reference_points[..., :ref_dim] = (
+                reg_out[..., :ref_dim] + inv_reference[..., :ref_dim]).sigmoid()
         return new_reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
 
     def forward(self, query, *args, **kwargs):

@@ -247,15 +247,15 @@ model = dict(
         sampling_steps=3,
         diffusion_scale=2.0,
         test_noise_seed=0,
-        box_renewal=True,
-        use_ensemble=True,
-        diffuse_query_content=True,
-        use_feature_proposal_init=True,
-        # Fused proposal init follows the fused decoder branch: BEV tokens and
-        # RV/image tokens are concatenated, projected by the proposal FFN, and
-        # the top-k fused tokens provide the initial reference points.
+        box_renewal=False,
+        use_ensemble=False,
+        diffuse_query_content=False,
+        use_feature_proposal_init=False,
+        # Keep MOAD's learned reference points as the initial diffusion anchor.
+        # The proposal FFN can be re-enabled later after the MOAD-preserving
+        # diffusion path is verified.
         proposal_init_mode='fused',
-        proposal_loss_weight=1.0,
+        proposal_loss_weight=0.0,
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
             dict(num_class=10, class_names=[
@@ -280,6 +280,8 @@ model = dict(
             decoder=dict(
                 type='DiffuMOMETransformerDecoder',
                 return_intermediate=True,
+                ref_query_pos_scale=0.0,
+                ref_update_scale=0.0,
                 num_layers=6,
                 transformerlayers=dict(
                     type='DiffuMOMETransformerDecoderLayer',

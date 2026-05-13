@@ -8,7 +8,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=4)
+evaluation = dict(interval=1)
 dataset_type = 'CustomNuScenesDataset'
 data_root = 'data/nuscenes/'
 input_modality = dict(
@@ -247,12 +247,13 @@ model = dict(
         sampling_steps=3,
         diffusion_scale=2.0,
         test_noise_seed=0,
-        box_renewal=True,
+        box_renewal=False,
         use_ensemble=False,
         diffuse_query_content=False,
-        use_feature_proposal_init=True,
+        use_feature_proposal_init=False,
         proposal_init_mode='fused',
-        proposal_loss_weight=1.0,
+        proposal_loss_weight=0.0,
+        cdn_with_timestep=True,
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
             dict(num_class=10, class_names=[
@@ -277,6 +278,8 @@ model = dict(
             decoder=dict(
                 type='DiffuMOMETransformerDecoder',
                 return_intermediate=True,
+                ref_query_pos_scale=0.0,
+                ref_update_scale=0.0,
                 num_layers=6,
                 transformerlayers=dict(
                     type='DiffuMOMETransformerDecoderLayer',
@@ -343,7 +346,7 @@ model = dict(
         )))
 optimizer = dict(
     type='AdamW',
-    lr=0.0001,
+    lr=2e-5,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.01, decay_mult=5),
@@ -358,7 +361,7 @@ optimizer_config = dict(
 
 lr_config = dict(
     policy='cyclic',
-    target_ratio=(6, 0.0001),
+    target_ratio=(1, 0.0001),
     cyclic_times=1,
     step_ratio_up=0.4)
 momentum_config = dict(

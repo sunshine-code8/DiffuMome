@@ -107,14 +107,19 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         sampling_steps = kwargs.pop('sampling_steps', 3)
         diffusion_scale = kwargs.pop('diffusion_scale', 2.0)
         test_noise_seed = kwargs.pop('test_noise_seed', 0)
-        box_renewal = kwargs.pop('box_renewal', True)
-        use_ensemble = kwargs.pop('use_ensemble', True)
-        diffuse_query_content = kwargs.pop('diffuse_query_content', True)
-        use_feature_proposal_init = kwargs.pop('use_feature_proposal_init', True)
+        box_renewal = kwargs.pop('box_renewal', False)
+        use_ensemble = kwargs.pop('use_ensemble', False)
+        diffuse_query_content = kwargs.pop('diffuse_query_content', False)
+        use_feature_proposal_init = kwargs.pop('use_feature_proposal_init', False)
         proposal_init_mode = kwargs.pop('proposal_init_mode', 'fused')
-        proposal_loss_weight = kwargs.pop('proposal_loss_weight', 1.0)
+        proposal_loss_weight = kwargs.pop('proposal_loss_weight', 0.0)
+        cdn_with_timestep = kwargs.pop('cdn_with_timestep', True)
+        reference_dim = kwargs.pop('reference_dim', 3)
+        test_gaussian_box_dims = kwargs.pop('test_gaussian_box_dims', True)
         assert init_cfg is None
         super(DiffuMultiExpertDecoding, self).__init__(init_cfg=init_cfg)
+        if reference_dim not in (3, 10):
+            raise ValueError('reference_dim must be 3 or 10, got {}'.format(reference_dim))
         self.num_classes = [len(t["class_names"]) for t in tasks]
         self.class_names = [t["class_names"] for t in tasks]
         self.hidden_dim = hidden_dim
@@ -144,6 +149,9 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         self.use_feature_proposal_init = use_feature_proposal_init
         self.proposal_init_mode = proposal_init_mode
         self.proposal_loss_weight = proposal_loss_weight
+        self.cdn_with_timestep = cdn_with_timestep
+        self.reference_dim = reference_dim
+        self.test_gaussian_box_dims = test_gaussian_box_dims
 
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
@@ -162,7 +170,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         # transformer
         self.transformer = build_transformer(transformer)
         # 闁告瑥鍊介埀顒€鍟伴崑?
-        self.reference_points = nn.Embedding(num_query, 3)
+        self.reference_points = nn.Embedding(num_query, self.reference_dim)
         self.total_num_classes = sum(self.num_classes)
         self.proposal_score = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -174,7 +182,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         self.proposal_ref = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, self.reference_dim),
         )
         self.label_enc = nn.Embedding(self.total_num_classes + 1, hidden_dim)
         self.query_embedding = nn.Sequential(
@@ -279,6 +287,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
             known_bbox_center = known_bboxs[:, :3].clone()
             known_bbox_scale = known_bboxs[:, 3:6].clone()
+            known_reference_state = self._box_to_reference_state(known_bboxs)
 
             # 闁告梻濮村▍鏃€绔? 闂佽棄鐗嗛顕€骞嶉埀顒勫嫉婢跺本鐣辨俊顐熷亾婵炴潙顑嗛、瀣焾閸婄喓绠婚悶娑樿嫰闁解晝绮?
             if self.bbox_noise_scale > 0:
@@ -294,6 +303,12 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                 known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (
                         self.pc_range[5] - self.pc_range[2])
                 known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
+                if self.reference_dim == 3:
+                    known_reference_state = known_bbox_center
+                else:
+                    known_reference_state = known_reference_state.clone()
+                    known_reference_state[..., 0:2] = known_bbox_center[..., 0:2]
+                    known_reference_state[..., 4:5] = known_bbox_center[..., 2:3]
                 ### 闁革綆浜滈敍鎰緞椤忓嫨浜ｉ柣銊ュ閻栵絿鎷嬫０浣界閻犳劗鍠愰悧閬嶅嫉?
                 # 闁革綆浜滈敍鎰板礉閻樿尙绻佸棰濅簻閵囧洭鏁嶇仦鎴掔剨缂佸倽宕靛﹢锟犲磹閻撳簺浜伴弶鈺傜玻缁辨繃娼诲▎鎴綒 query 閹煎瓨妫侀姘辨偖椤愩垻绉煎ù?閺夆晜鐟╅崳閿嬬閳ь剚绋婇崼銉ュ幋婵炲备鍓濆﹢?闁哄鍎撮鍕磼?
                 mask = torch.norm(rand_prob, 2, 1) > self.split
@@ -303,7 +318,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             single_pad = int(max(known_num))
             pad_size = int(single_pad * groups)
             # 閻?30 濞?DN 濞达絽绉堕悿鍡涙晬閸繂鐏ュ┑顔碱儎鐠愮喖姊跨拋鍦闁瑰嘲鍚嬬敮鎾捶?900 濞戞搩浜濋婊呮暜缁嬪灝妫橀柤鏉垮暟閸嬶綁宕滃澶嬫〃
-            padding_bbox = torch.zeros(batch_size, pad_size, 3, device=reference_points.device)
+            padding_bbox = torch.zeros(batch_size, pad_size, self.reference_dim, device=reference_points.device)
             if reference_points.dim() == 2:
                 base_reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
             else:
@@ -319,7 +334,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                 map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()  # 闁革负鍔岄崣蹇曚沪閳ь剟鎯冮崟顏嗙Т缂傚啰鎽礜
             # 闁?(batch_idx, position_idx) 缂佷究鍨圭槐鈺呮晬鐏炴儳惟闁告梻濮崇花锟犲闯椤忓嫸绱ｉ柣銊ュ濠€锟犲磹闂傜鍘煫鍥у暙濞兼寮介崶褝缍栭柛蹇嬪劚椤曨喗鎯旈弬鍓хТ缂?
             if len(known_bid):
-                padded_reference_points[(known_bid.long(), map_known_indice)] = known_bbox_center.to(
+                padded_reference_points[(known_bid.long(), map_known_indice)] = known_reference_state.to(
                     reference_points.device)
                 # padding 濞达絽绉堕悿鍡涘绩閸撗勭暠闁哄嫷鍨版慨鐐哄闯椤忓嫸绱ｉ柣銊ュ濞兼寮介崶顭戞敱
 
@@ -448,6 +463,7 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         return rv_embeds
 
     def query_embed(self, ref_points, img_metas):
+        ref_points = self._reference_center(ref_points)
         ### # 闁告鍠庨～?ref_points 闁告瑯鍨甸崗姗€寮垫径瀣偓顒傜博椤栨埃鍋撶涵椋庣闂傚牏鍋涢悥鍫曞箳閵夈劎绠?0 闁?1闁?
         # inverse_sigmoid 闁告劕鎳橀崕鎾儍?clamp 濞村吋纰嶉崺鍛村棘椤撶偛鐓?[eps, 1-eps]
         # sigmoid 闁告劕绉靛Σ褏浜搁崟顐ｇ [0, 1]
@@ -531,6 +547,67 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         ref[..., 2:3] = (height[..., 0:1] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
         return ref.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
 
+    def _reference_center(self, reference_points):
+        if reference_points.size(-1) == 3:
+            return reference_points
+        return torch.cat([reference_points[..., 0:2], reference_points[..., 4:5]], dim=-1)
+
+    def _box_to_reference_state(self, boxes):
+        center_ref = self._center_to_ref(boxes[..., :3])
+        if self.reference_dim == 3:
+            return center_ref
+
+        state = boxes.new_full(boxes.shape[:-1] + (10,), 0.5)
+        state[..., 0:2] = center_ref[..., 0:2]
+        state[..., 4:5] = center_ref[..., 2:3]
+        if boxes.size(-1) >= 6:
+            log_dims = boxes[..., 3:6].clamp_min(1e-3).log()
+            state[..., 2:4] = log_dims[..., 0:2].sigmoid()
+            state[..., 5:6] = log_dims[..., 2:3].sigmoid()
+        if boxes.size(-1) >= 7:
+            rot = boxes[..., 6:7]
+            state[..., 6:7] = (rot.sin() + 1.) * 0.5
+            state[..., 7:8] = (rot.cos() + 1.) * 0.5
+        if boxes.size(-1) >= 9:
+            state[..., 8:10] = (torch.tanh(boxes[..., 7:9] / 10.) + 1.) * 0.5
+        return state.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+
+    def _pred_to_reference_state(self, center, height, dim=None, rot=None, vel=None):
+        center_ref = self._world_to_ref(center, height)
+        if self.reference_dim == 3:
+            return center_ref
+
+        state = center_ref.new_full(center_ref.shape[:-1] + (10,), 0.5)
+        state[..., 0:2] = center_ref[..., 0:2]
+        state[..., 4:5] = center_ref[..., 2:3]
+        if dim is not None:
+            state[..., 2:4] = dim[..., 0:2].sigmoid()
+            state[..., 5:6] = dim[..., 2:3].sigmoid()
+        if rot is not None:
+            state[..., 6:8] = (torch.tanh(rot[..., 0:2]) + 1.) * 0.5
+        if vel is not None:
+            state[..., 8:10] = (torch.tanh(vel[..., 0:2] / 10.) + 1.) * 0.5
+        return state.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
+
+    def _apply_test_gaussian_box_dims(self, reference_scaled, base_reference_points=None, generator=None):
+        if self.reference_dim == 3 or not self.test_gaussian_box_dims:
+            return reference_scaled
+        if base_reference_points is not None:
+            base_scaled = (base_reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS) * 2. - 1.) * self.diffusion_scale
+            reference_scaled = reference_scaled.clone()
+            reference_scaled[..., 0:2] = base_scaled[..., 0:2]
+            reference_scaled[..., 4:5] = base_scaled[..., 4:5]
+        non_center = [2, 3, 5, 6, 7, 8, 9]
+        gaussian = torch.randn(
+            reference_scaled[..., non_center].shape,
+            device=reference_scaled.device,
+            dtype=reference_scaled.dtype,
+            generator=generator)
+        reference_scaled = reference_scaled.clone()
+        reference_scaled[..., non_center] = gaussian.clamp(
+            -self.diffusion_scale, self.diffusion_scale)
+        return reference_scaled
+
     def apply_box_noise(self, reference_points, t, noise=None):
         x_start = (reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS) * 2. - 1.) * self.diffusion_scale
         x_t = self.q_sample(x_start, t, noise=noise)
@@ -544,13 +621,13 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             fallback_refs = base_reference_points[batch_id] if batched_reference_points else base_reference_points
             gt_bboxes = self._unwrap_data(img_meta.get('gt_bboxes_3d', None))
             if gt_bboxes is not None and hasattr(gt_bboxes, 'gravity_center') and gt_bboxes.gravity_center.numel() > 0:
-                gt_centers = gt_bboxes.gravity_center.to(device)
-                gt_centers = gt_centers[torch.isfinite(gt_centers).all(dim=-1)]
-                if gt_centers.numel() == 0:
+                gt_boxes = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1).to(device)
+                gt_boxes = gt_boxes[torch.isfinite(gt_boxes).all(dim=-1)]
+                if gt_boxes.numel() == 0:
                     rand_idx = torch.randint(0, fallback_refs.shape[0], (self.num_query,), device=device)
                     batch_refs.append(fallback_refs[rand_idx])
                     continue
-                gt_refs = self._center_to_ref(gt_centers)
+                gt_refs = self._box_to_reference_state(gt_boxes)
                 if gt_refs.shape[0] >= self.num_query:
                     perm = torch.randperm(gt_refs.shape[0], device=device)[:self.num_query]
                     refs = gt_refs[perm]
@@ -580,15 +657,23 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                       hasattr(gt_bboxes, 'gravity_center') and
                       gt_bboxes.gravity_center.numel() > 0 and gt_labels.numel() > 0)
             if has_gt:
-                gt_centers = gt_bboxes.gravity_center.to(device)
+                gt_boxes = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1).to(device)
+                gt_centers = gt_boxes[:, :3]
                 gt_labels = gt_labels.long().to(device)
-                valid = torch.isfinite(gt_centers).all(dim=-1)
+                valid = torch.isfinite(gt_boxes).all(dim=-1)
                 valid = valid & (gt_labels >= 0) & (gt_labels < self.total_num_classes)
-                gt_centers = gt_centers[valid]
+                if gt_boxes.shape[-1] >= 6:
+                    valid = valid & (gt_boxes[:, 3:6] > 0).all(dim=-1)
+                gt_boxes = gt_boxes[valid]
                 gt_labels = gt_labels[valid]
-                if gt_centers.numel() > 0:
-                    gt_refs = self._center_to_ref(gt_centers)
-                    if gt_refs.shape[0] >= self.num_query:
+                if gt_boxes.numel() > 0:
+                    gt_refs = self._box_to_reference_state(gt_boxes)
+                    if self.reference_dim == 10:
+                        sample_inds = torch.randint(
+                            0, gt_refs.shape[0], (self.num_query,), device=device)
+                        refs = gt_refs[sample_inds]
+                        labels = gt_labels[sample_inds]
+                    elif gt_refs.shape[0] >= self.num_query:
                         perm = torch.randperm(gt_refs.shape[0], device=device)[:self.num_query]
                         refs = gt_refs[perm]
                         labels = gt_labels[perm]
@@ -600,9 +685,9 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                             gt_labels,
                             labels.new_full((self.num_query - gt_labels.shape[0],), self.total_num_classes)
                         ], dim=0)
-                        perm = torch.randperm(refs.shape[0], device=device)
-                        refs = refs[perm]
-                        labels = labels[perm]
+                    perm = torch.randperm(refs.shape[0], device=device)
+                    refs = refs[perm]
+                    labels = labels[perm]
                     batch_refs.append(refs)
                     batch_labels.append(labels)
                     continue
@@ -672,13 +757,17 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         rv_pos_embeds = self._rv_pe(x_img, img_metas)
         bev_pos_embeds = self.bev_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
         bev_query_embeds, rv_query_embeds = self.query_embed(reference_points, img_metas)
+        no_queries = None
+        if (not self.cdn_with_timestep and
+                mask_dict is not None and mask_dict.get('pad_size', 0) > 0):
+            no_queries = [mask_dict['pad_size']]
 
         modalities = copy.deepcopy(self.modalities["train" if self.training else "test"])
         outs_dec, ca_dict = self.transformer(
             x, x_img, bev_query_embeds, rv_query_embeds, bev_pos_embeds, rv_pos_embeds, img_metas,
             attn_masks=attn_mask, modalities=modalities, ref_points=reference_points, pc_range=self.pc_range,
             reg_branch=self.decoder_ref_branches, time_steps=time_steps, query_content=query_content,
-            query_embedding=self.query_embedding)
+            query_embedding=self.query_embedding, no_queries=no_queries)
         num_queries_per_modality = [m.shape[2] for m in outs_dec]
         outs_dec = torch.cat(outs_dec, dim=2)
         outs_dec = torch.nan_to_num(outs_dec)
@@ -695,7 +784,8 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             reference = reference_points[None].repeat(outs_dec.shape[0], 1, len(modalities), 1)
         else:
             reference = torch.cat(reference_layers, dim=2)
-        reference = inverse_sigmoid(reference.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS))
+        reference_center = self._reference_center(reference)
+        reference = inverse_sigmoid(reference_center.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS))
 
         flag = 0
         for task_id, task in enumerate(self.task_heads, 0):
@@ -757,7 +847,9 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             center = outs['center'][-1]
             height = outs['height'][-1]
             logits = outs['cls_logits'][-1].sigmoid().max(dim=-1).values
-            ref = self._world_to_ref(center, height)
+            ref = self._pred_to_reference_state(
+                center, height, outs.get('dim', [None])[-1],
+                outs.get('rot', [None])[-1], outs.get('vel', [None])[-1])
             if best_score is None:
                 best_score, best_ref = logits, ref
             else:
@@ -836,6 +928,9 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
             init_noise = torch.randn(base_reference_points.shape, device=device, generator=generator)
         reference_points, _ = self.apply_box_noise(base_reference_points, init_t, noise=init_noise)
         reference_scaled = (reference_points * 2. - 1.) * self.diffusion_scale
+        reference_scaled = self._apply_test_gaussian_box_dims(reference_scaled, base_reference_points, generator)
+        reference_points = ((reference_scaled / self.diffusion_scale) + 1.) * 0.5
+        reference_points = reference_points.clamp(REF_CLAMP_EPS, 1. - REF_CLAMP_EPS)
         # Keep MOAD decoder query semantics at test time: proposal FFN only
         # initializes reference points, while query content stays the original
         # zero target driven by MOAD query_pos/key_pos.
@@ -1144,8 +1239,8 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
         labels = proposal_logits.new_full(
             (batch_size, num_proposals), self.total_num_classes, dtype=torch.long)
         label_weights = proposal_logits.new_ones((batch_size, num_proposals))
-        ref_targets = proposal_refs.new_zeros((batch_size, num_proposals, 3))
-        ref_weights = proposal_refs.new_zeros((batch_size, num_proposals, 3))
+        ref_targets = proposal_refs.new_zeros((batch_size, num_proposals, self.reference_dim))
+        ref_weights = proposal_refs.new_zeros((batch_size, num_proposals, self.reference_dim))
         num_pos = 0
 
         for batch_id, (gt_bboxes, gt_labels) in enumerate(zip(gt_bboxes_3d, gt_labels_3d)):
@@ -1160,9 +1255,11 @@ class DiffuMultiExpertDecoding(BaseModule):   ### 閻庤鐭粻鐔肺涢埀
                 valid = valid & (gt_boxes[:, 3:6] > 0).all(dim=-1)
             if valid.sum() == 0:
                 continue
-            gt_refs = self._center_to_ref(gt_boxes[valid, :3])
+            gt_refs = self._box_to_reference_state(gt_boxes[valid])
             gt_labels = gt_labels[valid]
-            cost = torch.cdist(gt_refs, proposal_refs[batch_id], p=1)
+            cost = torch.cdist(
+                self._reference_center(gt_refs),
+                self._reference_center(proposal_refs[batch_id]), p=1)
             proposal_inds = cost.argmin(dim=1)
             labels[batch_id, proposal_inds] = gt_labels
             ref_targets[batch_id, proposal_inds] = gt_refs
