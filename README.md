@@ -1,16 +1,11 @@
 # DiffuMome
 
-epoch5
+epoch 6
 
-mAP: 0.5850                                                                                                                                                                                                                                                                                                         
-mATE: 0.3290
-
-mASE: 0.2609
-
-mAOE: 0.2539
-
-mAVE: 0.2490
-
-mAAE: 0.1828
-
-NDS: 0.6649
+mAP:  0.5998                                                                                                                                                                                                                                                                                                           
+mATE:  0.3244                                                                                                                                                                                                                                                                                                    
+mASE: 0.2576                                                                                                                                                                                                                                                                                                     
+mAOE: 0.2505                                                                                                                                                                                                                                                                                                
+mAVE: 0.2413                                                                                                                                                                                                                                                                                           
+mAAE:  0.1853                                                                                                                                                                                                                                                                                               
+NDS: 0.6740
