@@ -1,11 +1,12 @@
 # DiffuMome
 
-epoch 6
+epoch 8
 
-mAP:  0.5998                                                                                                                                                                                                                                                                                                           
-mATE:  0.3244                                                                                                                                                                                                                                                                                                    
-mASE: 0.2576                                                                                                                                                                                                                                                                                                     
-mAOE: 0.2505                                                                                                                                                                                                                                                                                                
-mAVE: 0.2413                                                                                                                                                                                                                                                                                           
-mAAE:  0.1853                                                                                                                                                                                                                                                                                               
-NDS: 0.6740
+mAP:  0.6837                                                                                                                                                                                                                                                                                                           
+mATE:  0.3012                                                                                                                                                                                                                                                                                                   
+mASE: 0.2526                                                                                                                                                                                                                                                                                                     
+mAOE: 0.2550
+
+mAVE: 0.2569                                                                                                                                                                                                                                                                                          
+mAAE:  0.1810                                                                                                                                                                                                                                                                                               
+NDS: 0.7172
